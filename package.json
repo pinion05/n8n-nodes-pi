@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-pi",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "n8n node to launch the pi coding agent headlessly (one-shot / new / continue session) with model dropdown, thinking levels, per-item concurrency pool, stall watchdog and cancel-safe process-tree kill",
   "keywords": [
     "n8n-community-node",

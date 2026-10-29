@@ -197,6 +197,31 @@ class PiAgent {
 				return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: `validation: prompt ${Buffer.byteLength(String(prompt), 'utf8')}바이트 — argv 단일 인자 한계(128KB) 초과. 파일로 쓰고 pi에게 읽게 하거나 프롬프트를 줄일 것` } };
 			}
 
+			const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+			if (thinking && !THINKING_LEVELS.includes(String(thinking))) {
+				return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: `validation: thinking '${thinking}' 무효 — off/minimal/low/medium/high/xhigh/max 중 하나. pi는 미지원 값을 조용히 기본값으로 클램프한다(2026-10-29 실측)` } };
+			}
+
+			if (operation === 'continue') {
+				// 세션 존재 선검증 — pi는 없는 세션 id를 조용히 새 세션으로 생성해 성공처럼 보인다 (2026-10-29 실측)
+				const fs2 = require('fs');
+				const path2 = require('path');
+				const sessDir = path2.join(os.homedir(), '.pi', 'agent', 'sessions');
+				let found = false;
+				try {
+					for (const slug of fs2.readdirSync(sessDir)) {
+						const d = path2.join(sessDir, slug);
+						let isDir = false;
+						try { isDir = fs2.statSync(d).isDirectory(); } catch { /* 무시 */ }
+						if (!isDir) continue;
+						if (fs2.readdirSync(d).some((f) => f.endsWith(`_${sessionId}.jsonl`))) { found = true; break; }
+					}
+				} catch { /* 세션 디렉토리 없음 */ }
+				if (!found) {
+					return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: `validation: 세션 ${String(sessionId).slice(0, 8)}… 을(를) 찾을 수 없다 — 없는 id는 pi가 새 세션으로 조용히 만들어 성공 위장하므로 중단했다. New Session으로 시작할 것` } };
+				}
+			}
+
 			if (model) args.push('--model', String(model));
 			if (thinking) args.push('--thinking', String(thinking));
 			if (options.noTools) args.push('--no-tools');
