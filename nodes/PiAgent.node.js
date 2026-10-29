@@ -121,6 +121,7 @@ class PiAgent {
 						{ displayName: 'Extra CLI Args', name: 'extraArgs', type: 'string', default: '', placeholder: '--no-tools 등 (공백 구분)', description: 'pi CLI에 전달할 추가 인자' },
 						{ displayName: 'Disable Tools', name: 'noTools', type: 'boolean', default: false, description: '--no-tools: 도구 없이 텍스트만 (LLM 답변만 필요할 때)' },
 						{ displayName: '동시 실행 (아이템 병렬)', name: 'concurrency', type: 'number', default: 1, typeOptions: { minValue: 1, maxValue: 64 }, description: '여러 입력 아이템을 동시에 스폰해 처리 (1=순차). 각 아이템의 프롬프트 표현식은 개별 아이템 기준으로 평가된다' },
+					{ displayName: '순간 실패 재시도', name: 'retries', type: 'number', default: 2, typeOptions: { minValue: 0, maxValue: 5 }, description: '순간 실패(pi exit 0·빈 텍스트·5초 미만 — 상류 rate limit 등) 시 2초×n 백오프 재시도. 2026-10-29 실측: 2일간 67건의 조용한 실패가 재시도 없이 유실됐다' },
 					],
 				},
 			],
@@ -183,7 +184,12 @@ class PiAgent {
 				if (name) args.push('--name', String(name));
 			} else {
 				sessionId = String(this.getNodeParameter('sessionId', i)).trim();
+				if (!sessionId) return { json: { ok: false, mode: operation, sessionId: null, killed: false, exitCode: null, error: 'validation: sessionId 빈 값 — continue 모드는 재개할 세션 id가 필요하다' } };
 				args.push('--session-id', sessionId);
+			}
+
+			if (!prompt || !String(prompt).trim()) {
+				return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: 'validation: prompt 빈 값 — 표현식 평가 결과가 비었다' } };
 			}
 
 			if (model) args.push('--model', String(model));
@@ -192,7 +198,19 @@ class PiAgent {
 			if (options.extraArgs) args.push(...String(options.extraArgs).split(/\s+/).filter(Boolean));
 			args.push('--', String(prompt));
 
-			const out = await runPi(args, cwd, timeoutSec * 1000, operation, sessionId, abortSignal);
+			// 순간 실패 재시도: exit 0 + 빈 텍스트 + 5초 미만 = 상류 순간 거부(rate limit 등) 시그니처.
+			// 같은 args(같은 sessionId)로 재스폰 — 2초×n 백오프.
+			const maxRetries = Math.max(0, Math.min(5, Number(options.retries ?? 2) || 0));
+			let attempt = 0;
+			let out;
+			while (true) {
+				out = await runPi(args, cwd, timeoutSec * 1000, operation, sessionId, abortSignal);
+				const transient = out && !out.killed && out.exitCode === 0 && !out.text && Number.isFinite(out.wallMs) && out.wallMs < 5000;
+				if (!transient || attempt >= maxRetries || (abortSignal && abortSignal.aborted)) break;
+				attempt += 1;
+				await new Promise((r) => setTimeout(r, 2000 * attempt));
+			}
+			if (attempt > 0) out.retries = attempt;
 			return { json: out };
 		};
 
@@ -246,7 +264,7 @@ function resolvePiBin() {
 // 프로세스 트리 전체 강제 종료 — pi는 bash 도구 자식을 별도 pgid로 띄우므로
 // ① /proc 자손 트리를 재귀 수집해 리프부터 킬 ② pi 본체·그룹 킬. (고아·좀비 방지)
 function killTree(child) {
-	if (!child || !child.pid || child.killed === true) { /* killed 플래그와 무관하게 pid 있으면 시도 */ }
+	// killed 플래그와 무관하게 pid가 있으면 시도 — 이미 죽었으면 개별 킬이 no-op 예외로 흡수된다
 	if (!child || !child.pid) return;
 	const fs = require('fs');
 	const collected = [];
@@ -269,7 +287,7 @@ function killTree(child) {
 function runPi(args, cwd, timeoutMs, operation, sessionId, abortSignal) {
 	return new Promise((resolve) => {
 		if (abortSignal && abortSignal.aborted) {
-			resolve({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'canceled: 실행 시작 전 취소' });
+			resolve({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, error: 'canceled-before-start', model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'canceled: 실행 시작 전 취소' });
 			return;
 		}
 
@@ -286,12 +304,15 @@ function runPi(args, cwd, timeoutMs, operation, sessionId, abortSignal) {
 			if (settled) return;
 			killed = true;
 			killTree(child);
-			finish({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'canceled: 실행 취소로 pi 프로세스 그룹 종료' });
+			finish({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, error: 'canceled', model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'canceled: 실행 취소로 pi 프로세스 그룹 종료' });
 		};
 		if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
-		let stdout = '';
-		let stderr = '';
+		// 청크를 Buffer로 적립하고 close에서 한 번에 디코드 — 청크 경계에서 한글(멀티바이트) 깨짐 방지
+		const stdoutChunks = [];
+		const stderrChunks = [];
+		const t0 = Date.now();
 		let killed = false;
+		let timedOut = false;
 		let settled = false;
 
 		const finish = (result) => {
@@ -305,14 +326,17 @@ function runPi(args, cwd, timeoutMs, operation, sessionId, abortSignal) {
 				// 성공(텍스트 있음)이면 디버그 파일 삭제, 실패면 남김
 				if (result && result.text) { try { require('fs').unlinkSync(dbg); } catch { /* 무시 */ } }
 			} else { try { require('fs').unlinkSync(dbg); } catch { /* 무시 */ } }
+			if (result) result.wallMs = Date.now() - t0; // 스폰→종료 실측 시간 (순간 실패 판정용)
 			resolve(result);
 		};
 
 		const timer = setTimeout(() => {
 			killed = true;
+			timedOut = true;
 			try { child.kill('SIGTERM'); } catch { /* 무시 */ }
 			try { if (child.pid) process.kill(-child.pid, 'SIGTERM'); } catch { /* 무시 */ }
-			setTimeout(() => killTree(child), 5000);
+			// 유예 후 강제 킬 — 이미 정상 종료로 마무리됐으면(pid 재사용 위험) 스킵
+			setTimeout(() => { if (!settled) killTree(child); }, 5000);
 		}, timeoutMs);
 
 		// 스톨 와치독: stdout이 300초(5분)간 침묵하면(스트림 행업) 강제 종료 — 풀 봉쇄 방지.
@@ -325,34 +349,40 @@ function runPi(args, cwd, timeoutMs, operation, sessionId, abortSignal) {
 				if (settled) return;
 				killed = true;
 				killTree(child);
-				finish({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'stall-watchdog: 300초간 출력 없음 — 스트림 행업으로 강제 종료' });
+				finish({ ok: false, mode: operation, sessionId, killed: true, exitCode: null, error: 'stall-watchdog', model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: 'stall-watchdog: 300초간 출력 없음 — 스트림 행업으로 강제 종료' });
 			}, STALL_MS);
 		};
 		armStall();
 
 		// 스폰 실패(ENOENT 등) 포함 — 절대 대기하지 않는다
 		child.on('error', (err) => {
-			finish({ ok: false, mode: operation, sessionId, killed, exitCode: null, model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: `pi spawn 실패 (${bin}): ${err.message}` });
+			finish({ ok: false, mode: operation, sessionId, killed, exitCode: null, error: 'spawn-failed', model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: `pi spawn 실패 (${bin}): ${err.message}` });
 		});
 
 		child.stdout.on('data', (d) => {
-			stdout += d.toString();
+			stdoutChunks.push(d); // Buffer 적립 — close에서 한 번에 디코드(청크 경계 한글 깨짐 방지)
 			armStall();
 			if (dbgFd !== null) { try { require('fs').appendFileSync(dbgFd, `[OUT] ${d}`); } catch { /* 무시 */ } }
 		});
 		child.stderr.on('data', (d) => {
-			stderr += d.toString();
+			stderrChunks.push(d);
+			armStall(); // stderr 활성 = 살아있음 — stdout만 보면 stderr에 로그 찍는 프로세스를 오탈한다
 			if (dbgFd !== null) { try { require('fs').appendFileSync(dbgFd, `[ERR] ${d}`); } catch { /* 무시 */ } }
 		});
 
 		child.on('close', (code) => {
+			const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+			const stderr = Buffer.concat(stderrChunks).toString('utf8');
 			const parsed = parsePiOutput(stdout);
+			const error = killed ? (timedOut ? 'timeout' : 'killed') : (code !== 0 ? `exit ${code}` : (!parsed.text ? 'empty-text (pi 정상 종료·빈 응답 — 상류 모델 순간 실패 시그니처)' : undefined));
 			finish({
 				ok: !killed && code === 0 && !!parsed.text,
 				mode: operation,
 				sessionId,
 				killed,
+				timedOut,
 				exitCode: code,
+				error,
 				model: parsed.model,
 				text: parsed.text,
 				usage: parsed.usage,
@@ -380,8 +410,8 @@ function parsePiOutput(stdout) {
 		const msgs = agentEnd.messages || [];
 		for (let i = msgs.length - 1; i >= 0; i--) {
 			const m = msgs[i];
-			if (m.role === 'assistant' && Array.isArray(m.content)) {
-				out.text = m.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n');
+			if (m.role === 'assistant' && (Array.isArray(m.content) || typeof m.content === 'string')) {
+				out.text = Array.isArray(m.content) ? m.content.filter((c) => c.type === 'text').map((c) => c.text).join('\n') : m.content;
 				out.model = m.model;
 				out.usage = m.usage;
 				out.cost = m.usage && m.usage.cost ? m.usage.cost.total : undefined;
