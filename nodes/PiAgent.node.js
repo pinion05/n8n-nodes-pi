@@ -191,6 +191,11 @@ class PiAgent {
 			if (!prompt || !String(prompt).trim()) {
 				return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: 'validation: prompt 빈 값 — 표현식 평가 결과가 비었다' } };
 			}
+			// Linux MAX_ARG_STRLEN=128KB/단일 인자 — 초과 시 spawn이 동기 던져 워크플로 크래시
+			// (2026-10-29 실측: 140KB 프롬프트 → 미처리 spawn E2BIG). 미리 검증해 클린 실패 반환
+			if (Buffer.byteLength(String(prompt), 'utf8') > 120000) {
+				return { json: { ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: `validation: prompt ${Buffer.byteLength(String(prompt), 'utf8')}바이트 — argv 단일 인자 한계(128KB) 초과. 파일로 쓰고 pi에게 읽게 하거나 프롬프트를 줄일 것` } };
+			}
 
 			if (model) args.push('--model', String(model));
 			if (thinking) args.push('--thinking', String(thinking));
@@ -299,7 +304,14 @@ function runPi(args, cwd, timeoutMs, operation, sessionId, abortSignal) {
 
 		const bin = resolvePiBin();
 		// detached=자체 프로세스 그룹 — killTree로 그룹 전체 종료 가능. 취소 신호 연결.
-		const child = spawn(bin, args, { cwd, env: { ...process.env, PATH: `${os.homedir()}/.npm-global/bin:${process.env.PATH || ''}` }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+		let child;
+		try {
+			child = spawn(bin, args, { cwd, env: { ...process.env, PATH: `${os.homedir()}/.npm-global/bin:${process.env.PATH || ''}` }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+		} catch (err) {
+			// spawn이 동기 던지는 경우(E2BIG·ENOENT cwd 등) — child 객체 반환 전이라 'error' 핸들러가 붙기 전이다 (2026-10-29 실측 크래시)
+			finish({ ok: false, mode: operation, sessionId, killed: false, exitCode: null, error: 'spawn-failed', model: undefined, text: undefined, usage: undefined, cost: undefined, durationMs: undefined, stderrTail: `pi spawn 동기 실패 (${bin}): ${err.message}` });
+			return;
+		}
 		const onAbort = () => {
 			if (settled) return;
 			killed = true;
